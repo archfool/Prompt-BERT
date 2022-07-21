@@ -254,6 +254,7 @@ class ModelArguments:
         metadata={
         }
     )
+    # 是否加载原生bert的cls.predictions.transform进行输出层处理
     mask_embedding_sentence_org_mlp: bool = field(
         default=False,
         metadata={
@@ -379,6 +380,10 @@ class DataTrainingArguments:
         metadata={"help": "Ratio of tokens to mask for MLM (only effective if --do_mlm)"}
     )
 
+    csv_sep: str = field(
+        default='\x01', metadata={"help": "csv文件的分隔符"}
+    )
+
     def __post_init__(self):
         if self.dataset_name is None and self.train_file is None and self.validation_file is None:
             raise ValueError("Need either a dataset name or a training/validation file.")
@@ -484,6 +489,13 @@ def main():
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    direction_name = "_".join([
+        "delta" if model_args.mask_embedding_sentence_delta else "no-delta",
+        "org-mlp" if model_args.mask_embedding_sentence_org_mlp else "no-org-mlp",
+        str(training_args.seed),
+    ])
+    training_args.output_dir = os.path.join(training_args.output_dir, direction_name)
+
     if (
             os.path.exists(training_args.output_dir)
             and os.listdir(training_args.output_dir)
@@ -534,7 +546,9 @@ def main():
         extension = "text"
     if extension == "csv":
         datasets = load_dataset("./load_dataset_utils/csv.py", data_files=data_files, cache_dir="./data/",
-                                delimiter=",")
+                                delimiter=data_args.csv_sep)
+    elif extension == "text":
+        datasets = load_dataset("./load_dataset_utils/text.py", data_files=data_files, cache_dir="./data/")
     else:
         datasets = load_dataset("./load_dataset_utils/text.py", data_files=data_files, cache_dir="./data/")
 
@@ -561,7 +575,7 @@ def main():
     }
 
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, **tokenizer_kwargs)
-
+    config.__setattr__("max_seq_length", data_args.max_seq_length)
     if model_args.model_name_or_path:
         if 'roberta' in model_args.model_name_or_path:
             model = RobertaForCL.from_pretrained(
@@ -626,8 +640,9 @@ def main():
             template = model_args.mask_embedding_sentence_template
             assert ' ' not in template
             template = template.replace('*mask*', tokenizer.mask_token) \
-                .replace('*sep+*', '') \
-                .replace('*cls*', '').replace('*sent_0*', ' ')
+                .replace('*sep+*', '').replace('*cls*', '') \
+                .replace('*sent_0*', ' ')
+            # 根据目标文本的位置，将完整的prompt文本风格成begin string（bs）和end string（es）两部分
             template = template.split(' ')
             model_args.mask_embedding_sentence_bs = template[0].replace('_', ' ')
             if 'roberta' in model_args.model_name_or_path:
@@ -698,6 +713,7 @@ def main():
                     s = tokenizer.encode(s, add_special_tokens=False)[:data_args.max_seq_length]
                     sent_features['input_ids'].append(bs2 + s + es2)
 
+            # 将当前batch的输入语料，补齐到同样长度，并生成attention_mask
             ml = max([len(i) for i in sent_features['input_ids']])
             for i in range(len(sent_features['input_ids'])):
                 t = sent_features['input_ids'][i]
@@ -806,12 +822,22 @@ def main():
             print('d template mask_embedding_template', tokenizer.decode(model.mask_embedding_template2))
             print('d template mask_embedding_template', model.mask_embedding_template2)
 
+        # todo 这里有问题，要改
         if model_args.mask_embedding_sentence_autoprompt:
+            # mask在prompt模板内的位置
             mask_index = model.mask_embedding_template.index(tokenizer.mask_token_id)
+            # MASK在prompt模板的位置（出去BOS和EOS）
+            model.mask_index = model.mask_embedding_template.index(tokenizer.mask_token_id) - 1
+            # 剔除BOS、EOS、MASK后的prompt模板，即待训练的内容
             index_mbv = model.mask_embedding_template[1:mask_index] + model.mask_embedding_template[mask_index + 1:-1]
-
             model.dict_mbv = index_mbv
-            model.fl_mbv = [i <= 3 for i, k in enumerate(index_mbv)]
+            # prompt模板前半段的长度
+            model.bs_len = len(model.bs)
+            # prompt模板后半段的长度（带mask）
+            model.es_len = len(model.es)
+
+            # model.fl_mbv = [i <= 3 for i, k in enumerate(index_mbv)]
+            # model.fl_mbv = [i < len(model.bs) for i, k in enumerate(index_mbv)]
 
             if len(model_args.mask_embedding_sentence_autoprompt_continue_training) > 0:
                 state_dict = torch.load(
@@ -823,6 +849,7 @@ def main():
                         mlp_state_dict[i[4:]] = state_dict[i]
                 model.mlp.load_state_dict(mlp_state_dict)
             else:
+                # 使用词表embedding参数初始化连续prompt模板参数
                 p_mbv_w = model.bert.embeddings.word_embeddings.weight[model.dict_mbv].clone()
             model.register_parameter(name='p_mbv', param=torch.nn.Parameter(p_mbv_w))
             if model_args.mask_embedding_sentence_autoprompt_freeze_prompt:

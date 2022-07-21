@@ -1,6 +1,7 @@
 /.idea
 
 /data/text
+/data/csv
 
 /prompt_bert/__pycache__
 /datasets/__pycache__

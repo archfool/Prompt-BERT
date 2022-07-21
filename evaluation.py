@@ -84,7 +84,7 @@ def main():
     parser.add_argument("--model_name_or_path", type=str,
             help="Transformers' model name or path")
     parser.add_argument("--pooler", type=str,
-            choices=['cls', 'cls_before_pooler', 'avg',  'avg_first_last'],
+            choices=['cls', 'cls_before_pooler', 'avg',  'avg_first_last', 'avg_top2'],
             default='cls', 
             help="Which pooler to use")
     parser.add_argument("--mode", type=str, 

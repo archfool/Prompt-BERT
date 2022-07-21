@@ -11,6 +11,8 @@ import torch
 import transformers
 from transformers import AutoModel, AutoTokenizer
 
+from prompt_bert.models import map_mbv_idx
+
 # Set up logger
 logging.basicConfig(format='%(asctime)s : %(message)s', level=logging.DEBUG)
 
@@ -52,7 +54,7 @@ def get_delta(model, template, tokenizer, device, args):
     return delta, template_len
 
 
-def main():
+def main(sents, model_path=None, delta_flag=None, org_mlp_flag=None, autoprompt=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--embedding_only", action='store_true')
     parser.add_argument('--mlm_head_predict', action='store_true')
@@ -68,7 +70,7 @@ def main():
     parser.add_argument("--model_name_or_path", type=str,
                         help="Transformers' model name or path")
     parser.add_argument("--pooler", type=str,
-                        choices=['cls', 'cls_before_pooler', 'avg', 'avg_first_last'],
+                        choices=['cls', 'cls_before_pooler', 'avg', 'avg_first_last', 'avg_top2'],
                         default='cls',
                         help="Which pooler to use")
     parser.add_argument("--mode", type=str,
@@ -80,34 +82,45 @@ def main():
                         default='sts',
                         help="What set of tasks to evaluate on. If not 'na', this will override '--tasks'")
     parser.add_argument('--calc_anisotropy', action='store_true')
+    parser.add_argument("--ori_model_name_or_path", type=str,
+                        help="Transformers' model name or path")
 
     args = parser.parse_args()
+    args.model_name_or_path = args.model_name_or_path if model_path is None else model_path
+    args.mask_embedding_sentence_delta = args.mask_embedding_sentence_delta if delta_flag is None else delta_flag
+    args.mask_embedding_sentence_org_mlp = args.mask_embedding_sentence_org_mlp if org_mlp_flag is None else org_mlp_flag
+    args.mask_embedding_sentence_autoprompt = args.mask_embedding_sentence_autoprompt if autoprompt is None else autoprompt
 
+    map_location = None if torch.cuda.is_available() else 'cpu'
     # Load transformers' model checkpoint
     if args.mask_embedding_sentence_org_mlp:
         # only for bert-base
         from transformers import BertForMaskedLM, BertConfig
-        config = BertConfig.from_pretrained("bert-base-uncased")
-        mlp = BertForMaskedLM.from_pretrained('bert-base-uncased', config=config).cls.predictions.transform
-        if 'result' in args.model_name_or_path:
-            state_dict = torch.load(args.model_name_or_path + '/pytorch_model.bin')
-            new_state_dict = {}
-            for key, param in state_dict.items():
-                # Replace "mlp" to "pooler"
-                if 'pooler' in key:
-                    key = key.replace("pooler.", "")
-                    new_state_dict[key] = param
-            mlp.load_state_dict(new_state_dict)
+        config = BertConfig.from_pretrained(args.ori_model_name_or_path)
+        mlp = BertForMaskedLM.from_pretrained(args.ori_model_name_or_path, config=config).cls.predictions.transform
+        state_dict = torch.load(os.path.join(args.model_name_or_path, 'pytorch_model.bin'), map_location=map_location)
+        new_state_dict = {}
+        for key, param in state_dict.items():
+            # Replace "mlp" to "pooler"
+            if 'mlp' in key:
+                key = key.replace("mlp.", "")
+                new_state_dict[key] = param
+        mlp.load_state_dict(new_state_dict)
     model = AutoModel.from_pretrained(args.model_name_or_path)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
 
+    # todo 这里有问题，要改
     if args.mask_embedding_sentence_autoprompt:
-        state_dict = torch.load(args.model_name_or_path + '/pytorch_model.bin')
+        state_dict = torch.load(os.path.join(args.model_name_or_path, 'pytorch_model.bin'), map_location=map_location)
         p_mbv = state_dict['p_mbv']
         template = args.mask_embedding_sentence_template
         template = template.replace('*mask*', tokenizer.mask_token) \
-            .replace('*sep+*', '') \
-            .replace('*cls*', '').replace('*sent_0*', ' ').replace('_', ' ')
+            .replace('*sep+*', '').replace('*cls*', '') \
+            .replace('*sent_0*', ' ')
+        mask_embedding_sentence_bs = template.split(' ')[0].replace('_', ' ')
+        bs = tokenizer.encode(mask_embedding_sentence_bs, add_special_tokens=False)
+        bs_len = len(bs)
+        template = template.replace('_', ' ')
         mask_embedding_template = tokenizer.encode(template)
         mask_index = mask_embedding_template.index(tokenizer.mask_token_id)
         index_mbv = mask_embedding_template[1:mask_index] + mask_embedding_template[mask_index + 1:-1]
@@ -115,7 +128,7 @@ def main():
         # index_mbv = mask_embedding_template[1:7] + mask_embedding_template[8:9]
 
         dict_mbv = index_mbv
-        fl_mbv = [i <= 3 for i, k in enumerate(index_mbv)]
+        # fl_mbv = [i <= 3 for i, k in enumerate(index_mbv)]
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -126,7 +139,6 @@ def main():
 
     if args.mask_embedding_sentence_delta:
         delta, template_len = get_delta(model, args.mask_embedding_sentence_template, tokenizer, device, args)
-
 
     # todo 中文场景需要新的停用词
     if args.remove_continue_word:
@@ -158,7 +170,7 @@ def main():
                 .replace('*cls*', '')
 
             for i, s in enumerate(sentences):
-                # todo 提到配置项
+                # todo 用配置项配置
                 if len(s) > 0 and s[-1] not in '。？"\'': s += '。'
                 sentences[i] = template.replace('*sent 0*', s).strip()
         elif args.remove_continue_word:
@@ -220,16 +232,21 @@ def main():
                 p = torch.arange(input_ids.shape[1]).to(input_ids.device).view(1, -1)
                 b = torch.arange(input_ids.shape[0]).to(input_ids.device)
                 for i, k in enumerate(dict_mbv):
-                    if fl_mbv[i]:
-                        index = ((input_ids == k) * p).max(-1)[1]
+                    if True:
+                        index = map_mbv_idx(dict_mbv, i, bs_len, mask_index - 1, input_ids, batch['attention_mask'])
                     else:
-                        index = ((input_ids == k) * -p).min(-1)[1]
+                        if fl_mbv[i]:
+                            index = ((input_ids == k) * p).max(-1)[1]
+                        else:
+                            index = ((input_ids == k) * -p).min(-1)[1]
+                    # print(i, k, index, index_)
                     inputs_embeds[b, index] = p_mbv[i]
                 batch['input_ids'], batch['inputs_embeds'] = None, inputs_embeds
                 outputs = model(**batch, output_hidden_states=True, return_dict=True)
                 batch['input_ids'] = input_ids
 
                 last_hidden = outputs.last_hidden_state
+                # todo 核心输出数据，提取[MASK]位置的embedding
                 pooler_output = last_hidden[input_ids == tokenizer.mask_token_id]
 
                 if args.mask_embedding_sentence_org_mlp:
@@ -253,6 +270,7 @@ def main():
                     pooler_output = outputs['last_hidden_state'][:, 0, :]
                 if args.mask_embedding_sentence:
                     last_hidden = outputs.last_hidden_state
+                    # todo 核心输出数据，提取[MASK]位置的embedding
                     pooler_output = last_hidden[batch['input_ids'] == tokenizer.mask_token_id]
                     if args.mask_embedding_sentence_org_mlp:
                         pooler_output = mlp(pooler_output)
@@ -306,15 +324,18 @@ def main():
         else:
             raise NotImplementedError
 
-    result = batcher(["我爱机器学习", "机器学习不爱我"])
+    result = batcher(sents)
     embeds = result.detach().numpy()
-    sent0_vec = embeds[0]
-    sent1_vec = embeds[1]
-    cos_sim = cal_cosine_sim(embeds[0], embeds[1])
-    print(cos_sim)
+    # sent0_vec = embeds[0]
+    # sent1_vec = embeds[1]
+    # cos_sim = cal_cosine_sim(embeds[0], embeds[1])
+    # print(cos_sim)
 
-    print("END")
+    print("END EVALUATION")
+    return embeds
 
 
 if __name__ == "__main__":
-    main()
+    sents = ["我爱机器学习", "机器学习不爱我"]
+    result = main(sents)
+    print('END')
